@@ -21,7 +21,29 @@ MOTION_START = 5.
 ARRIVAL_HOLD = 1.
 TRANSFER_TIME = 2.
 UNLOAD_TIME = 3.
+FINAL_SETTLE = 1.
 FINAL_HOLD = 1.
+INITIAL_SETTLING_END = 1.  # Squeeze starts after this settling window.
+MAX_PRELOAD_DISPLACEMENT = .015
+CUBE_SPEED_LIMIT = .2
+
+
+def cube_motion_violations(t, position, speed, start_position, gravity):
+    """Bound initial settling separately from subsequent controlled motion."""
+    violations = []
+    if t < PRELOAD_END:
+        displacement = float(np.linalg.norm(np.asarray(position)-start_position))
+        if displacement > MAX_PRELOAD_DISPLACEMENT:
+            violations.append(f'preload_displacement_m={displacement:.6g}>'
+                              f'{MAX_PRELOAD_DISPLACEMENT:.6g}')
+    # The supplied cube starts about 4 mm above its settled support height.
+    # Limit that motion by the allowed displacement and free-fall energy,
+    # including 0.05 m/s contact allowance; do not apply transport speed yet.
+    limit = (np.sqrt(2.*gravity*MAX_PRELOAD_DISPLACEMENT)+.05
+             if t < INITIAL_SETTLING_END else CUBE_SPEED_LIMIT)
+    if speed > limit:
+        violations.append(f'cube_speed_m_s={speed:.6g}>{limit:.6g}')
+    return violations
 
 
 def check_pose(pose):
@@ -269,7 +291,7 @@ class TransportCycle:
         self.motion_end = MOTION_START+trajectory.duration
         self.transfer = self.motion_end+ARRIVAL_HOLD
         self.unload = self.transfer+TRANSFER_TIME
-        self.duration = self.unload+UNLOAD_TIME+FINAL_HOLD
+        self.duration = self.unload+UNLOAD_TIME+FINAL_SETTLE+FINAL_HOLD
         self.base0,self.base_rot0 = sim.p.getBasePositionAndOrientation(sim.robot)
         _,self.cube_rot0 = sim.p.getBasePositionAndOrientation(sim.cubeId)
         self.offset = self.relative = None
@@ -288,7 +310,7 @@ class TransportCycle:
 
     def commands(self,t):
         reference,pose,velocity,acceleration = self.trajectory.sample(t-MOTION_START)
-        squeeze = self.squeeze*smooth_profile(t-1.,3.)[0]
+        squeeze = self.squeeze*smooth_profile(t-INITIAL_SETTLING_END,3.)[0]
         support = smooth_profile(t-PRELOAD_END,1.)[0]
         if t<PRELOAD_END:
             phase='preload'
@@ -302,7 +324,12 @@ class TransportCycle:
             phase='load_transfer'
             support = 1.-smooth_profile(t-self.transfer,TRANSFER_TIME)[0]
         else:
-            phase='unload' if t<self.unload+UNLOAD_TIME else 'final_hold'
+            if t < self.unload+UNLOAD_TIME:
+                phase = 'unload'
+            elif t < self.unload+UNLOAD_TIME+FINAL_SETTLE:
+                phase = 'final_settle'
+            else:
+                phase = 'final_hold'
             support=0.
             squeeze *= 1.-smooth_profile(t-self.unload,UNLOAD_TIME)[0]
         support_force = .5*self.mass*(np.array([0.,0.,self.gravity*support])+acceleration)
@@ -361,11 +388,22 @@ class TransportCycle:
         cube_angle=angle(rot,self.cube_rot0)
         finite=np.all(np.isfinite(np.r_[q,v,pos,rot,inward,table,robot_table,obstacle,
                                        cube_error,slip,cube_speed,drift,base_rot,support,tau]))
-        invalid=(not finite or error>.15 or speed>5 or drift>.02
-            or angle(base_rot,self.base_rot0)>.05 or cube_angle>.15
-            or robot_table>5 or obstacle>1 or cube_speed>.2
-            or (self.offset is not None and cube_error>.02)
-            or (PRELOAD_END<=t<self.unload and slip>.015) or self.grip_loss>.1)
+        violations = cube_motion_violations(t,pos,cube_speed,
+                                           self.trajectory.start.translation,self.gravity)
+        if not finite:
+            violations.append('non_finite_observation_or_torque')
+        limits = [('joint_error_rad',error,.15),('joint_speed_rad_s',speed,5.),
+                  ('base_drift_m',drift,.02),
+                  ('base_rotation_rad',angle(base_rot,self.base_rot0),.05),
+                  ('cube_rotation_rad',cube_angle,.15),('robot_table_load_N',robot_table,5.),
+                  ('obstacle_load_N',obstacle,1.),('grip_loss_time_s',self.grip_loss,.1)]
+        if self.offset is not None:
+            limits.append(('cube_tracking_error_m',cube_error,.02))
+        if PRELOAD_END<=t<self.unload:
+            limits.append(('relative_slip_m',slip,.015))
+        violations.extend(f'{name}={value:.6g}>{limit:.6g}'
+                          for name,value,limit in limits if value>limit)
+        invalid = bool(violations)
         self.writer.writerow([t,phase,squeeze,*support,*inward,table,robot_table,obstacle,
             cube_error,slip,error,speed,cube_speed,int(clipped),int(apply and not invalid),
             *pos,*desired,drift,cube_angle,self.grip_loss,
@@ -376,7 +414,8 @@ class TransportCycle:
             self.next_report=t+.5
             self.last_phase=phase
         if invalid:
-            raise RuntimeError('Transport stopped; inspect final CSV row. Proposed torque not applied.')
+            raise RuntimeError('Transport stopped: '+'; '.join(violations)+
+                               '. Proposed torque not applied; inspect final CSV row.')
         self.peak_joint_error=max(self.peak_joint_error,error)
         self.peak_cube_error=max(self.peak_cube_error,cube_error)
         if phase=='transport' and apply and table<.5 and np.all(inward>1.):

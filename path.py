@@ -20,7 +20,7 @@ from tools import collision, jointlimitsviolated, setcubeplacement
 # The cube settles about 4 mm relative to its nominal reference. The robot's
 # reference does not share that translation, so use a separate initial margin.
 # Loaded tracking and actual contacts still need dynamics validation.
-OBSTACLE_CLEARANCE_REQUIREMENTS = {'robot': 0.001, 'cube': 0.008}
+OBSTACLE_CLEARANCE_REQUIREMENTS = {'robot': 0.002, 'cube': 0.008}
 
 
 def record_rejection(diagnostics, stage, reason, detail=None):
