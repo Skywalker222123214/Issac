@@ -87,6 +87,40 @@ class PlannedTrajectory:
         return reference,pose,dh*self.cube_deltas[i],ddh*self.cube_deltas[i]
 
 
+def collision_pair_names(robot):
+    """Read the results of the most recent collision(robot, q) call."""
+    names = []
+    for pair, result in zip(robot.collision_model.collisionPairs,
+                            robot.collision_data.collisionResults):
+        if result.isCollision():
+            objects = robot.collision_model.geometryObjects
+            names.append(f'{objects[pair.first].name} <-> {objects[pair.second].name}')
+    return names
+
+
+def limit_joint_names(robot, q):
+    violated = ((q < robot.model.lowerPositionLimit)
+                | (q > robot.model.upperPositionLimit))
+    return [str(robot.model.names[i+1]) for i in np.flatnonzero(violated)]
+
+
+def diagnose_segment(robot, cube, trajectory, segment):
+    """Print extra samples only after rejection; never accept or alter a path."""
+    print('[CHECK DETAIL] Rejected segment samples (zero-based indices):', flush=True)
+    for fraction in (0., .25, .5, .75, 1.):
+        q = ((1.-fraction)*trajectory.points[segment]
+             + fraction*trajectory.points[segment+1])
+        pose = trajectory.cube_path[segment].copy()
+        pose.translation = pose.translation + fraction*trajectory.cube_deltas[segment]
+        setcubeplacement(robot, cube, pose)
+        limits = limit_joint_names(robot, q)
+        colliding = bool(collision(robot, q))
+        pairs = collision_pair_names(robot) if colliding else []
+        xyz = np.array2string(pose.translation, precision=9, separator=',')
+        print(f'[CHECK DETAIL] fraction={fraction:.6f}; cube_xyz={xyz}; '
+              f'limit_joints={limits}; collision={colliding}; pairs={pairs}', flush=True)
+
+
 def validate_reference(robot,cube,trajectory):
     """Denser independent samples, not a continuous collision certificate."""
     frames = [robot.model.getFrameId(n) for n in (LEFT_HAND,RIGHT_HAND)]
@@ -109,8 +143,21 @@ def validate_reference(robot,cube,trajectory):
                 pose = trajectory.cube_path[i].copy()
                 pose.translation = pose.translation+u*trajectory.cube_deltas[i]
                 setcubeplacement(robot,cube,pose)
-                if jointlimitsviolated(robot,q) or collision(robot,q):
-                    raise RuntimeError(f'Preflight collision/limit violation: segment={i}, fraction={u:.6f}')
+                limit_violation = bool(jointlimitsviolated(robot,q))
+                in_collision = bool(collision(robot,q)) if not limit_violation else False
+                if limit_violation or in_collision:
+                    # Capture these results before the diagnostic samples update them.
+                    limits = limit_joint_names(robot,q) if limit_violation else []
+                    pairs = collision_pair_names(robot) if in_collision else []
+                    message = (f'Preflight collision/limit violation: segment={i}, fraction={u:.6f}; '
+                               f'limit_joints={limits}; collision={in_collision}; pairs={pairs}')
+                    print('[CHECK FAILURE]', message, flush=True)
+                    try:
+                        diagnose_segment(robot,cube,trajectory,i)
+                    except Exception as exc:
+                        # Optional reporting must not replace the actual rejection.
+                        print(f'[CHECK DETAIL] Additional samples unavailable: {exc}', flush=True)
+                    raise RuntimeError(message)
                 pin.framesForwardKinematics(robot.model,robot.data,q)
                 for frame, hook in zip(frames,local_hooks):
                     relative = robot.data.oMf[frame].inverse()*(pose*hook)
