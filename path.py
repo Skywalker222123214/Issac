@@ -15,6 +15,38 @@ from inverse_geometry import computeqgrasppose
 from config import LEFT_HAND, RIGHT_HAND, LEFT_HOOK, RIGHT_HOOK
 from tools import collision, jointlimitsviolated, setcubeplacement
 
+# Experimental execution allowance: the measured initial cube settling is
+# about 4 mm. Keep additional room for tracking errors near the obstacle.
+# This is a planning margin, not a lecturer-specified or hardware limit.
+MIN_OBSTACLE_CLEARANCE = 0.008
+
+
+def obstacle_clearance(robot):
+    """Minimum obstacle distance after collision(robot, q) updates geometry.
+
+    Include pairs with the obstacle on either side: the explicitly added
+    obstacle/cube pair has the cube as its second object.
+    """
+    model, data = robot.collision_model, robot.collision_data
+    obstacle = model.getGeometryId('obstaclebase_0')
+    if obstacle >= len(model.geometryObjects):
+        raise RuntimeError('Obstacle geometry obstaclebase_0 is missing')
+    minimum, closest = np.inf, None
+    for index, pair in enumerate(model.collisionPairs):
+        if pair.first != obstacle and pair.second != obstacle:
+            continue
+        distance = float(pin.computeDistance(model, data, index).min_distance)
+        if not np.isfinite(distance):
+            raise RuntimeError('Non-finite obstacle distance')
+        if distance < minimum:
+            minimum = distance
+            closest = (f'{model.geometryObjects[pair.first].name} <-> '
+                       f'{model.geometryObjects[pair.second].name}')
+    if closest is None:
+        raise RuntimeError('No obstacle collision pairs are configured')
+    return minimum, closest
+
+
 def samplegrasp(
     robot, cube, qseed,
     cube_start, cube_goal,
@@ -196,6 +228,9 @@ def check_grasp_edge(
                     or orientation_error >= orientation_tolerance):
                 return [], [], False
             if collision(robot, q):
+                return [], [], False
+            clearance, _ = obstacle_clearance(robot)
+            if clearance < MIN_OBSTACLE_CLEARANCE:
                 return [], [], False
 
     return edge_qs, edge_cubes, True
