@@ -58,6 +58,8 @@ if __name__ == "__main__":
     parser.add_argument('--plan-only', action='store_true',
                         help='Check and save a path without advancing the simulation')
     parser.add_argument('--plan', help='Use a saved .npz path; all checks are repeated')
+    parser.add_argument('--max-iterations', type=int, default=2000,
+                        help='RRT search budget when not loading a saved plan (default: 2000)')
     args = parser.parse_args()
 
     robot, sim, cube = setupwithpybullet()
@@ -76,7 +78,8 @@ if __name__ == "__main__":
                 path, cube_path = load_plan(args.plan)
             else:
                 path = computepath(q0, qe, CUBE_PLACEMENT, CUBE_PLACEMENT_TARGET,
-                                   robot=robot, cube=cube, cube_path_out=cube_path)
+                                   robot=robot, cube=cube, cube_path_out=cube_path,
+                                   max_iterations=args.max_iterations)
             if len(path) < 2:
                 raise RuntimeError('Planner did not return a usable path')
 

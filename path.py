@@ -6,6 +6,7 @@ Created on Thu Sep 21 11:44:32 2023
 @author: stonneau
 """
 import time
+from collections import Counter
 
 import pinocchio as pin
 import numpy as np
@@ -19,6 +20,37 @@ from tools import collision, jointlimitsviolated, setcubeplacement
 # about 4 mm. Keep additional room for tracking errors near the obstacle.
 # This is a planning margin, not a lecturer-specified or hardware limit.
 MIN_OBSTACLE_CLEARANCE = 0.008
+
+
+def record_rejection(diagnostics, stage, reason, detail=None):
+    if diagnostics is not None:
+        key = f'{stage}.{reason}'
+        diagnostics['counts'][key] += 1
+        if detail is not None:
+            diagnostics['last'][key] = detail
+
+
+def collision_pair_names(robot):
+    return [f'{robot.collision_model.geometryObjects[pair.first].name} <-> '
+            f'{robot.collision_model.geometryObjects[pair.second].name}'
+            for pair, result in zip(robot.collision_model.collisionPairs,
+                                    robot.collision_data.collisionResults)
+            if result.isCollision()]
+
+
+def report_search(G, q_goal, cube_goal, iteration, maximum, diagnostics, final=False):
+    positions = np.array([node[2].translation for node in G])
+    best_q = min(distance(node[1], q_goal) for node in G)
+    best_cube = min(norm(node[2].translation-cube_goal.translation) for node in G)
+    print(f'[RRT] {iteration}/{maximum}, nodes={len(G)}, '
+          f'best_q={best_q:.6f}rad, best_cube={best_cube:.6f}m, '
+          f'tree_z=[{positions[:,2].min():.6f},{positions[:,2].max():.6f}]m', flush=True)
+    print('[RRT COUNTS]', dict(sorted(diagnostics['counts'].items())), flush=True)
+    if final:
+        print('[RRT TREE] cube_min=', positions.min(axis=0),
+              'cube_max=', positions.max(axis=0), flush=True)
+        for key, detail in sorted(diagnostics['last'].items()):
+            print(f'[RRT LAST] {key}: {detail}', flush=True)
 
 
 def obstacle_clearance(robot):
@@ -140,7 +172,8 @@ def check_grasp_edge(
     translation_resolution=0.005,
     rotation_resolution=0.05,
     position_tolerance=1e-3,
-    orientation_tolerance=1e-3
+    orientation_tolerance=1e-3,
+    diagnostics=None, stage='edge'
 ):
     """Return edge samples only after checking between every returned pair.
 
@@ -205,6 +238,7 @@ def check_grasp_edge(
             cube_pose = pin.SE3.Interpolate(ca, cb, fraction)
 
             if jointlimitsviolated(robot, q):
+                record_rejection(diagnostics,stage,'joint_limits')
                 return [], [], False
 
             setcubeplacement(robot, cube, cube_pose)
@@ -226,11 +260,16 @@ def check_grasp_edge(
             )
             if (position_error >= position_tolerance
                     or orientation_error >= orientation_tolerance):
+                record_rejection(diagnostics,stage,'grasp',
+                                 f'position={position_error:.9f}m, angle={orientation_error:.9f}rad')
                 return [], [], False
             if collision(robot, q):
+                record_rejection(diagnostics,stage,'collision',collision_pair_names(robot))
                 return [], [], False
-            clearance, _ = obstacle_clearance(robot)
+            clearance, pair = obstacle_clearance(robot)
             if clearance < MIN_OBSTACLE_CLEARANCE:
+                record_rejection(diagnostics,stage,'clearance',
+                                 f'distance={clearance:.9f}m, pair={pair}')
                 return [], [], False
 
     return edge_qs, edge_cubes, True
@@ -241,7 +280,8 @@ def connect_grasp_projected(
     joint_resolution=0.03,
     translation_resolution=0.003,
     rotation_resolution=0.03,
-    max_joint_step=0.15
+    max_joint_step=0.15,
+    diagnostics=None
 ):
     """Try a connection using intermediate grasp configurations."""
 
@@ -286,17 +326,20 @@ def connect_grasp_projected(
             )
 
             if not success:
+                record_rejection(diagnostics,'goal','ik_failed')
                 return [], [], False
 
         # Reject jumps between different IK solutions.
         if distance(q_previous, q_next) > max_joint_step:
+            record_rejection(diagnostics,'goal','joint_jump')
             return [], [], False
 
         # Check the actual small connection, including both endpoints.
         edge_qs, edge_cubes, success = check_grasp_edge(
             robot, cube,
             q_previous, q_next,
-            cube_previous, cube_next
+            cube_previous, cube_next,
+            diagnostics=diagnostics, stage='goal'
         )
 
         if not success:
@@ -324,12 +367,11 @@ def rrt(
     # Added cube poses, grasp constraints, and stored edge samples.
     G = [(None, q_init.copy(), cube_start.copy())]
     edges = {}
+    diagnostics = {'counts': Counter(), 'last': {}}
 
     for iteration in range(max_iterations):
         if iteration % 200 == 0:
-            print(
-                f"[RRT] {iteration}/{max_iterations}, nodes={len(G)}"
-            )
+            report_search(G,q_goal,cube_goal,iteration,max_iterations,diagnostics)
 
         # 1. Sometimes aim directly towards the goal.
         if np.random.rand() < goal_bias:
@@ -342,6 +384,7 @@ def rrt(
             )
 
             if not sample_success:
+                diagnostics['counts']['sample_failed'] += 1
                 continue
 
         # 2. Find the nearest existing node.
@@ -356,17 +399,20 @@ def rrt(
         )
 
         if not step_success:
+            diagnostics['counts']['extension_failed'] += 1
             continue
 
         # Avoid adding a node that makes essentially no progress.
         if distance(q_near, q_new) < 1e-6:
+            diagnostics['counts']['no_progress'] += 1
             continue
 
         # 4. Check the connection before adding the node.
         edge_qs, edge_cubes, edge_success = check_grasp_edge(
             robot, cube,
             q_near, q_new,
-            cube_near, cube_new
+            cube_near, cube_new,
+            diagnostics=diagnostics, stage='growth'
         )
 
         if not edge_success:
@@ -382,12 +428,15 @@ def rrt(
         ))
 
         edges[new_index] = (edge_qs, edge_cubes)
+        diagnostics['counts']['growth.accepted'] += 1
 
         # 6. Try to connect this node to the EXACT goal configuration.
+        diagnostics['counts']['goal.attempts'] += 1
         goal_qs, goal_cubes, goal_success = connect_grasp_projected(
             robot, cube,
             q_new, q_goal,
-            cube_new, cube_goal
+            cube_new, cube_goal,
+            diagnostics=diagnostics
         )
 
         if goal_success:
@@ -401,8 +450,11 @@ def rrt(
 
             edges[goal_index] = (goal_qs, goal_cubes)
 
+            report_search(G,q_goal,cube_goal,iteration+1,max_iterations,diagnostics,final=True)
             return G, edges, True
 
+    report_search(G,q_goal,cube_goal,max_iterations,max_iterations,diagnostics,final=True)
+    print('[RRT] Search budget exhausted; no complete path found.', flush=True)
     return G, edges, False
 
 
@@ -423,6 +475,29 @@ def computepath(
         raise ValueError("Pass the initialized robot and cube to computepath.")
     if cube_path_out is not None:
         cube_path_out.clear()
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations <= 0:
+        raise ValueError('max_iterations must be a positive integer')
+
+    # Reject impossible endpoint clearance before spending the search budget.
+    # This checks endpoint geometry, not global reachability of the task.
+    try:
+        for label, q, pose in [('start', qinit, cubeplacementq0),
+                               ('goal', qgoal, cubeplacementqgoal)]:
+            setcubeplacement(robot,cube,pose)
+            if jointlimitsviolated(robot,q):
+                print(f'[RRT ENDPOINT] {label}: joint-limit violation', flush=True)
+                return []
+            if collision(robot,q):
+                print(f'[RRT ENDPOINT] {label}: collision={collision_pair_names(robot)}', flush=True)
+                return []
+            clearance, pair = obstacle_clearance(robot)
+            print(f'[RRT ENDPOINT] {label}: clearance={clearance:.9f}m; '
+                  f'required={MIN_OBSTACLE_CLEARANCE:.9f}m; pair={pair}', flush=True)
+            if clearance < MIN_OBSTACLE_CLEARANCE:
+                print(f'[RRT ENDPOINT] {label} rejected: insufficient clearance.', flush=True)
+                return []
+    finally:
+        setcubeplacement(robot,cube,cubeplacementq0)
 
     G, edges, found = rrt(
         robot, cube, qinit, qgoal,
