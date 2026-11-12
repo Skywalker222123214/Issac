@@ -99,7 +99,7 @@ def samplegrasp(
 
     upper = np.maximum(
         cube_start.translation, cube_goal.translation
-    ) + np.array([0.05, 0.05, 0.15])
+    ) + np.array([0.05, 0.05, 0.20])
 
     for _ in range(max_attempts):
 
