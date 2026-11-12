@@ -14,7 +14,7 @@ from config import DT, LEFT_HAND, RIGHT_HAND, LEFT_HOOK, RIGHT_HOOK
 from trajectory import PathTrajectory
 from tools import setcubeplacement, collision, jointlimitsviolated
 from grasp_cycle import hand_link_groups, measure_contact, smooth_profile
-from path import obstacle_clearance, MIN_OBSTACLE_CLEARANCE
+from path import obstacle_clearance, OBSTACLE_CLEARANCE_REQUIREMENTS
 
 PRELOAD_END = 4.
 MOTION_START = 5.
@@ -117,7 +117,8 @@ def diagnose_segment(robot, cube, trajectory, segment):
         limits = limit_joint_names(robot, q)
         colliding = bool(collision(robot, q))
         pairs = collision_pair_names(robot) if colliding else []
-        clearance = None if colliding else obstacle_clearance(robot)[0]
+        clearance = (None if colliding else
+                     {component: result[0] for component, result in obstacle_clearance(robot).items()})
         xyz = np.array2string(pose.translation, precision=9, separator=',')
         print(f'[CHECK DETAIL] fraction={fraction:.6f}; cube_xyz={xyz}; '
               f'limit_joints={limits}; collision={colliding}; pairs={pairs}; '
@@ -133,7 +134,7 @@ def validate_reference(robot,cube,trajectory):
     pin.framesForwardKinematics(cube.model,cube.data,cube.q0)
     local_hooks = [cube.data.oMf[i].copy() for i in hooks]
     max_position = max_angle = 0.
-    minimum_clearance = np.inf
+    minimum_clearance = {component: np.inf for component in OBSTACLE_CLEARANCE_REQUIREMENTS}
     checked = 0
     try:
         for i, duration in enumerate(trajectory.joints.segment_times):
@@ -162,18 +163,19 @@ def validate_reference(robot,cube,trajectory):
                         # Optional reporting must not replace the actual rejection.
                         print(f'[CHECK DETAIL] Additional samples unavailable: {exc}', flush=True)
                     raise RuntimeError(message)
-                clearance, closest_pair = obstacle_clearance(robot)
-                minimum_clearance = min(minimum_clearance, clearance)
-                if clearance < MIN_OBSTACLE_CLEARANCE:
-                    message = (f'Preflight obstacle clearance: segment={i}, fraction={u:.6f}; '
-                               f'distance={clearance:.9f}m; required={MIN_OBSTACLE_CLEARANCE:.9f}m; '
-                               f'pair={closest_pair}')
-                    print('[CHECK FAILURE]', message, flush=True)
-                    try:
-                        diagnose_segment(robot,cube,trajectory,i)
-                    except Exception as exc:
-                        print(f'[CHECK DETAIL] Additional samples unavailable: {exc}', flush=True)
-                    raise RuntimeError(message)
+                for component, (clearance, closest_pair) in obstacle_clearance(robot).items():
+                    minimum_clearance[component] = min(minimum_clearance[component], clearance)
+                    required = OBSTACLE_CLEARANCE_REQUIREMENTS[component]
+                    if clearance < required:
+                        message = (f'Preflight {component} obstacle clearance: '
+                                   f'segment={i}, fraction={u:.6f}; distance={clearance:.9f}m; '
+                                   f'required={required:.9f}m; pair={closest_pair}')
+                        print('[CHECK FAILURE]', message, flush=True)
+                        try:
+                            diagnose_segment(robot,cube,trajectory,i)
+                        except Exception as exc:
+                            print(f'[CHECK DETAIL] Additional samples unavailable: {exc}', flush=True)
+                        raise RuntimeError(message)
                 pin.framesForwardKinematics(robot.model,robot.data,q)
                 for frame, hook in zip(frames,local_hooks):
                     relative = robot.data.oMf[frame].inverse()*(pose*hook)
@@ -191,12 +193,15 @@ def validate_reference(robot,cube,trajectory):
     stats = dict(configurations=len(trajectory.points),checked_states=checked,
         motion_duration_s=trajectory.duration,max_grasp_position_error_m=max_position,
         max_grasp_orientation_error_rad=max_angle,
-        min_obstacle_clearance_m=minimum_clearance,
-        required_obstacle_clearance_m=MIN_OBSTACLE_CLEARANCE,
+        min_robot_obstacle_clearance_m=minimum_clearance['robot'],
+        min_cube_obstacle_clearance_m=minimum_clearance['cube'],
+        required_robot_obstacle_clearance_m=OBSTACLE_CLEARANCE_REQUIREMENTS['robot'],
+        required_cube_obstacle_clearance_m=OBSTACLE_CLEARANCE_REQUIREMENTS['cube'],
         continuous_collision_guarantee=False)
     print(f'[CHECK] passed: {checked} samples; grasp <= {max_position:.9f}m / {max_angle:.9f}rad')
-    print(f'[CHECK] obstacle clearance >= {minimum_clearance:.6f}m '
-          f'(required {MIN_OBSTACLE_CLEARANCE:.6f}m)')
+    for component, clearance in minimum_clearance.items():
+        print(f'[CHECK] {component} obstacle clearance >= {clearance:.6f}m '
+              f'(required {OBSTACLE_CLEARANCE_REQUIREMENTS[component]:.6f}m)')
     print(f'[CHECK] motion duration={trajectory.duration:.3f}s; all waypoints retained')
     return frames,stats
 

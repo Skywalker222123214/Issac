@@ -16,10 +16,11 @@ from inverse_geometry import computeqgrasppose
 from config import LEFT_HAND, RIGHT_HAND, LEFT_HOOK, RIGHT_HOOK
 from tools import collision, jointlimitsviolated, setcubeplacement
 
-# Experimental execution allowance: the measured initial cube settling is
-# about 4 mm. Keep additional room for tracking errors near the obstacle.
-# This is a planning margin, not a lecturer-specified or hardware limit.
-MIN_OBSTACLE_CLEARANCE = 0.008
+# Experimental allowances, not lecturer-specified or hardware limits.
+# The cube settles about 4 mm relative to its nominal reference. The robot's
+# reference does not share that translation, so use a separate initial margin.
+# Loaded tracking and actual contacts still need dynamics validation.
+OBSTACLE_CLEARANCE_REQUIREMENTS = {'robot': 0.001, 'cube': 0.008}
 
 
 def record_rejection(diagnostics, stage, reason, detail=None):
@@ -54,29 +55,34 @@ def report_search(G, q_goal, cube_goal, iteration, maximum, diagnostics, final=F
 
 
 def obstacle_clearance(robot):
-    """Minimum obstacle distance after collision(robot, q) updates geometry.
+    """Separate robot/cube distances after collision(robot, q) updates geometry.
 
     Include pairs with the obstacle on either side: the explicitly added
     obstacle/cube pair has the cube as its second object.
     """
     model, data = robot.collision_model, robot.collision_data
     obstacle = model.getGeometryId('obstaclebase_0')
-    if obstacle >= len(model.geometryObjects):
-        raise RuntimeError('Obstacle geometry obstaclebase_0 is missing')
-    minimum, closest = np.inf, None
+    cube = model.getGeometryId('cubebase_0')
+    if max(obstacle, cube) >= len(model.geometryObjects):
+        raise RuntimeError('Required obstaclebase_0 or cubebase_0 geometry is missing')
+    minimum = {component: (np.inf, None)
+               for component in OBSTACLE_CLEARANCE_REQUIREMENTS}
     for index, pair in enumerate(model.collisionPairs):
         if pair.first != obstacle and pair.second != obstacle:
             continue
+        other = pair.second if pair.first == obstacle else pair.first
+        component = 'cube' if other == cube else 'robot'
         distance = float(pin.computeDistance(model, data, index).min_distance)
         if not np.isfinite(distance):
             raise RuntimeError('Non-finite obstacle distance')
-        if distance < minimum:
-            minimum = distance
-            closest = (f'{model.geometryObjects[pair.first].name} <-> '
-                       f'{model.geometryObjects[pair.second].name}')
-    if closest is None:
-        raise RuntimeError('No obstacle collision pairs are configured')
-    return minimum, closest
+        if distance < minimum[component][0]:
+            names = (f'{model.geometryObjects[pair.first].name} <-> '
+                     f'{model.geometryObjects[pair.second].name}')
+            minimum[component] = (distance, names)
+    for component, (_, names) in minimum.items():
+        if names is None:
+            raise RuntimeError(f'No {component}/obstacle collision pairs are configured')
+    return minimum
 
 
 def samplegrasp(
@@ -266,11 +272,11 @@ def check_grasp_edge(
             if collision(robot, q):
                 record_rejection(diagnostics,stage,'collision',collision_pair_names(robot))
                 return [], [], False
-            clearance, pair = obstacle_clearance(robot)
-            if clearance < MIN_OBSTACLE_CLEARANCE:
-                record_rejection(diagnostics,stage,'clearance',
-                                 f'distance={clearance:.9f}m, pair={pair}')
-                return [], [], False
+            for component, (clearance, pair) in obstacle_clearance(robot).items():
+                if clearance < OBSTACLE_CLEARANCE_REQUIREMENTS[component]:
+                    record_rejection(diagnostics,stage,f'{component}_clearance',
+                                     f'distance={clearance:.9f}m, pair={pair}')
+                    return [], [], False
 
     return edge_qs, edge_cubes, True
 def connect_grasp_projected(
@@ -490,12 +496,14 @@ def computepath(
             if collision(robot,q):
                 print(f'[RRT ENDPOINT] {label}: collision={collision_pair_names(robot)}', flush=True)
                 return []
-            clearance, pair = obstacle_clearance(robot)
-            print(f'[RRT ENDPOINT] {label}: clearance={clearance:.9f}m; '
-                  f'required={MIN_OBSTACLE_CLEARANCE:.9f}m; pair={pair}', flush=True)
-            if clearance < MIN_OBSTACLE_CLEARANCE:
-                print(f'[RRT ENDPOINT] {label} rejected: insufficient clearance.', flush=True)
-                return []
+            for component, (clearance, pair) in obstacle_clearance(robot).items():
+                required = OBSTACLE_CLEARANCE_REQUIREMENTS[component]
+                print(f'[RRT ENDPOINT] {label}: {component}_clearance={clearance:.9f}m; '
+                      f'required={required:.9f}m; pair={pair}', flush=True)
+                if clearance < required:
+                    print(f'[RRT ENDPOINT] {label} rejected: insufficient {component} clearance.',
+                          flush=True)
+                    return []
     finally:
         setcubeplacement(robot,cube,cubeplacementq0)
 
